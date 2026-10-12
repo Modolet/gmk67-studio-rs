@@ -112,7 +112,7 @@ fn main() -> Result<()> {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(1080.), px(740.))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("GMK67 Studio".into()),
+                    title: Some(concat!("GMK67 Studio ", env!("CARGO_PKG_VERSION")).into()),
                     ..Default::default()
                 }),
                 app_id: Some("io.xxyx.gmk67-studio-rs".into()),

@@ -5,5 +5,6 @@
 
 pub mod device;
 pub mod layout;
+pub mod lighting_preview;
 pub mod profile;
 pub mod protocol;

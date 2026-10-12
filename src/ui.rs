@@ -7,6 +7,7 @@ use anyhow::Result;
 use gmk67_studio_rs::{
     device::{self, Keyboard},
     layout::{KEYS, OUTPUTS, output_label},
+    lighting_preview,
     profile::{EFFECTS, Profile},
     protocol,
 };
@@ -15,13 +16,13 @@ use gpui_kit::{
         Disableable, Sizable, WindowExt,
         button::{Button, ButtonVariants},
         color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
-        dialog::DialogButtonProps,
+        dialog::{DialogButtonProps, DialogFooter},
         select::{Select, SelectEvent, SelectState},
     },
     prelude::FluentBuilder as _,
     *,
 };
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{collections::BTreeSet, path::PathBuf, time::Instant};
 
 const BG: u32 = 0x101516;
 const PANEL: u32 = 0x192022;
@@ -47,6 +48,10 @@ pub struct Studio {
     error: bool,
     dirty: bool,
     subscriptions: Vec<Subscription>,
+    preview_seconds: f32,
+    preview_last_tick: Instant,
+    preview_playing: bool,
+    ripple: Option<(f32, f32, f32)>,
 }
 
 enum Job {
@@ -145,6 +150,10 @@ impl Studio {
             error,
             dirty: false,
             subscriptions,
+            preview_seconds: 0.,
+            preview_last_tick: Instant::now(),
+            preview_playing: true,
+            ripple: None,
         };
         if !demo {
             this.start(Job::Scan, cx);
@@ -205,6 +214,7 @@ impl Studio {
                         this.status = format!("{e:#}");
                     }
                 }
+                eprintln!("[GMK67] {}", this.status);
                 cx.notify();
             });
         })
@@ -235,6 +245,13 @@ impl Studio {
             let this = this.clone();
             let device = device.clone();
             let profile = profile.clone();
+            let target_path = device.path.to_string_lossy().into_owned();
+            let apply = std::rc::Rc::new(move |cx: &mut App| {
+                let _ = this.update(cx, |this, cx| {
+                    this.start(Job::Apply(device.clone(), profile.clone(), keymap), cx)
+                });
+            });
+            let apply_button = apply.clone();
             dialog
                 .title(if keymap {
                     "替换键盘改键配置？"
@@ -242,27 +259,53 @@ impl Studio {
                     "应用灯光到键盘？"
                 })
                 .child(
-                    div().flex().flex_col().gap_3().child(description).child(
-                        div()
-                            .text_sm()
-                            .child(format!("目标：{}", device.path.to_string_lossy())),
-                    ),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(description)
+                        .child(div().text_sm().child(format!("目标：{target_path}"))),
                 )
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("确认写入")
                         .cancel_text("取消"),
                 )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("cancel-write")
+                                .label("取消")
+                                .outline()
+                                .on_click(|_, window, cx| {
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("confirm-write")
+                                .label("确认写入")
+                                .primary()
+                                .on_click(move |_, window, cx| {
+                                    apply_button(cx);
+                                    window.close_dialog(cx);
+                                }),
+                        ),
+                )
                 .on_ok(move |_, _, cx| {
-                    let _ = this.update(cx, |this, cx| {
-                        this.start(Job::Apply(device.clone(), profile.clone(), keymap), cx)
-                    });
+                    apply(cx);
                     true
                 })
         });
     }
 
     fn select_key(&mut self, id: u8, cx: &mut Context<Self>) {
+        if let Some(key) = KEYS.iter().find(|key| key.id == id) {
+            self.ripple = Some((
+                key.x + key.width / 2.,
+                f32::from(key.row),
+                self.preview_seconds,
+            ));
+        }
         if self.tab == 1 {
             self.selected_keys.clear();
             self.selected_keys.insert(id);
@@ -377,8 +420,22 @@ impl Studio {
                 let selected = self.selected_keys.contains(&id);
                 let modified = self.tab == 1 && self.profile.keymap.contains_key(&id);
                 let color = self.profile.colors.get(&id).copied().unwrap_or([0, 0, 0]);
+                let color = if self.tab == 0 {
+                    lighting_preview::color(
+                        self.profile.effect,
+                        color,
+                        key,
+                        self.preview_seconds,
+                        self.ripple,
+                    )
+                } else {
+                    color
+                };
                 let tint =
                     (u32::from(color[0]) << 16) | (u32::from(color[1]) << 8) | u32::from(color[2]);
+                let glow = ((u32::from(color[0]) / 5 + 12) << 16)
+                    | ((u32::from(color[1]) / 5 + 17) << 8)
+                    | (u32::from(color[2]) / 5 + 18);
                 let caption = if self.tab == 1 {
                     self.profile
                         .keymap
@@ -404,7 +461,13 @@ impl Studio {
                     } else {
                         0x38474a
                     }))
-                    .bg(rgb(if selected { 0x2a4441 } else { 0x20292b }))
+                    .bg(rgb(if self.tab == 0 {
+                        glow
+                    } else if selected {
+                        0x2a4441
+                    } else {
+                        0x20292b
+                    }))
                     .cursor_pointer()
                     .hover(|style| style.bg(rgb(0x304044)))
                     .flex()
@@ -478,7 +541,22 @@ impl Studio {
                     .border_1()
                     .border_color(rgb(EDGE))
                     .bg(rgb(PANEL))
-                    .child(Self::heading("灯效", "先在本地预览，再应用到键盘"))
+                    .child(Self::heading("灯效", "动态示意 · 实际效果以键盘为准"))
+                    .child(
+                        Button::new("toggle-preview")
+                            .ghost()
+                            .small()
+                            .label(if self.preview_playing {
+                                "暂停预览"
+                            } else {
+                                "播放预览"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.preview_playing = !this.preview_playing;
+                                this.preview_last_tick = Instant::now();
+                                cx.notify();
+                            })),
+                    )
                     .child(div().flex().flex_wrap().gap_2().children(
                         EFFECTS.iter().enumerate().map(|(i, label)| {
                             let active = usize::from(self.profile.effect) == i + 1;
@@ -490,6 +568,9 @@ impl Studio {
                                 .disabled(self.busy)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.profile.effect = (i + 1) as u8;
+                                    this.preview_seconds = 0.;
+                                    this.preview_last_tick = Instant::now();
+                                    this.ripple = None;
                                     this.dirty = true;
                                     cx.notify();
                                 }))
@@ -632,6 +713,19 @@ impl Render for Studio {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Retain subscriptions for the editors for the entire view lifetime.
         let _ = &self.subscriptions;
+        let now = Instant::now();
+        if self.tab == 0 && self.preview_playing && self.profile.effect != 1 {
+            self.preview_seconds += now
+                .duration_since(self.preview_last_tick)
+                .as_secs_f32()
+                .min(0.1);
+            let view = cx.entity().downgrade();
+            window.on_next_frame(move |_, cx| {
+                let _ = view.update(cx, |_, cx| cx.notify());
+            });
+            window.request_animation_frame();
+        }
+        self.preview_last_tick = now;
         let unit = ((f32::from(window.viewport_size().width) - 370.) / 16.).clamp(38., 74.);
         div().size_full().flex().flex_col().bg(rgb(BG)).text_color(rgb(INK)).text_sm()
             .child(div().flex().items_center().justify_between().px_6().py_5().border_b_1().border_color(rgb(EDGE))
@@ -679,6 +773,8 @@ pub fn snapshot(path: &std::path::Path) -> Result<()> {
     app.update(|cx| {
         init(cx);
         component::Theme::change(component::ThemeMode::Dark, None, cx);
+        // Freeze overlay transitions so recorded bounds stay valid during clicks.
+        cx.set_reduce_motion(true);
     });
     let mut studio = None;
     let window = app.open_window(size(px(1340.), px(900.)), |window, cx| {
@@ -716,6 +812,31 @@ pub fn snapshot(path: &std::path::Path) -> Result<()> {
         window.render_frame(cx);
     })?;
     app.capture_screenshot(window.into())?.save(path)?;
+    app.update_window(window.into(), |_, window, cx| {
+        window.click(("effect", 5usize), cx);
+    })?;
+    let before = app.capture_screenshot(window.into())?;
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    app.update_window(window.into(), |_, window, cx| window.render_frame(cx))?;
+    let after = app.capture_screenshot(window.into())?;
+    assert_ne!(
+        before.as_raw(),
+        after.as_raw(),
+        "wave preview did not animate"
+    );
+    after.save(path.with_file_name("wave.png"))?;
+    app.update_window(window.into(), |_, window, cx| {
+        window.click("toggle-preview", cx)
+    })?;
+    let paused = app.update(|cx| studio.read(cx).preview_seconds);
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    app.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        studio.read_with(cx, |view, _| {
+            assert_eq!(view.preview_seconds, paused, "paused preview advanced")
+        });
+        window.click(("effect", 0usize), cx);
+    })?;
     let keymap_path = path.with_file_name("keymap.png");
     app.update_window(window.into(), |_, window, cx| {
         window.click(("tab", 1usize), cx);
@@ -744,8 +865,69 @@ pub fn snapshot(path: &std::path::Path) -> Result<()> {
         window.render_frame(cx);
     })?;
     app.capture_screenshot(window.into())?.save(&keymap_path)?;
+    for tab in [0, 1] {
+        app.update_window(window.into(), |_, window, cx| {
+            studio.update(cx, |view, cx| {
+                view.demo = false;
+                view.preview_playing = false;
+                view.tab = tab;
+                view.devices = vec![Keyboard {
+                    path: std::ffi::CString::new("/gmk67-test-no-device").unwrap(),
+                    manufacturer: "hfd.cn".into(),
+                    product: "USB DEVICE".into(),
+                    serial: String::new(),
+                }];
+                view.selected_device = Some(0);
+                cx.notify();
+            });
+            window.render_frame(cx);
+            window.click("apply", cx);
+        })?;
+        app.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.within("dialog").find("confirm-write").visible());
+            assert!(window.within("dialog").find("cancel-write").visible());
+        })?;
+        if tab == 0 {
+            app.capture_screenshot(window.into())?
+                .save(path.with_file_name("confirmation.png"))?;
+        }
+        app.update_window(window.into(), |_, window, cx| {
+            window.within("dialog").click("cancel-write", cx);
+        })?;
+        app.run_until_parked();
+        app.update_window(window.into(), |_, window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            studio.read_with(cx, |view, _| {
+                assert!(!view.busy, "cancel started an I/O job")
+            });
+        })?;
+    }
+    app.update_window(window.into(), |_, window, cx| {
+        studio.update(cx, |view, cx| {
+            view.tab = 0;
+            cx.notify();
+        });
+        window.click("apply", cx);
+    })?;
+    app.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.within("dialog").click("confirm-write", cx);
+    })?;
+    app.run_until_parked();
+    app.update_window(window.into(), |_, window, cx| {
+        assert!(!window.has_active_dialog(cx));
+        studio.read_with(cx, |view, _| {
+            assert!(!view.busy);
+            assert!(
+                view.error && view.status.contains("设备已断开"),
+                "confirm did not run the write job against the nonexistent test path: {}",
+                view.status
+            );
+        });
+    })?;
     println!(
-        "UI interactions passed; screenshots: {}, {}",
+        "UI interactions and confirm/cancel passed; screenshots: {}, {}",
         path.display(),
         keymap_path.display()
     );
