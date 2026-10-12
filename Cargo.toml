@@ -1,0 +1,22 @@
+[package]
+name = "gmk67-studio-rs"
+version = "0.1.0"
+edition = "2024"
+authors = ["modolet <y@xxyx.io>"]
+description = "Native Rust and GPUI Kit configuration studio for the original ZUOYA GMK67"
+license = "MIT"
+repository = "https://github.com/Modolet/gmk67-studio-rs"
+default-run = "gmk67-studio-rs"
+
+[features]
+preview = ["gpui-kit/test-support"]
+
+[profile.dev]
+debug = 1
+
+[dependencies]
+anyhow = "1.0.104"
+gpui-kit = "0.7.3"
+hidapi = "2.6.7"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"

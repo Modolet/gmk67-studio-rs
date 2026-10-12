@@ -1,0 +1,5 @@
+/target/
+/.direnv/
+/AGENTS.md
+/docs/
+*.log
